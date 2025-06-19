@@ -1,0 +1,226 @@
+import cv2
+import numpy as np
+import os
+import sys
+import serial
+import time
+from typing import List, Tuple
+from collections import deque
+
+class TrafficAnalyzer:
+    def __init__(self, video_paths: List[str], arduino_port: str = 'COM3', baud_rate: int = 9600):
+        self.video_paths = video_paths
+        self.min_contour_area = 500
+        self.arduino_port = arduino_port
+        self.baud_rate = baud_rate
+        self.ser = None
+        self.setup_resources()
+        self.last_green_lane = None
+        self.last_switch_time = time.time()
+        self.green_duration = 0
+        self.lane_queue = deque()
+        self.force_switch = False
+
+    def setup_resources(self):
+        """Initialize video captures, background subtractors, and Arduino connection"""
+        try:
+            # Initialize video captures
+            self.caps = [cv2.VideoCapture(os.path.abspath(path)) for path in self.video_paths]
+            for i, cap in enumerate(self.caps):
+                if not cap.isOpened():
+                    raise FileNotFoundError(f"Could not open video: {self.video_paths[i]}")
+            
+            # Initialize background subtractors
+            self.back_subs = [cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25) 
+                            for _ in range(4)]
+            
+            # Try to initialize Arduino connection, but don't fail if not available
+            try:
+                self.ser = serial.Serial(self.arduino_port, self.baud_rate, timeout=1)
+                time.sleep(2)  # Allow time for Arduino initialization
+                print(f"Serial port {self.arduino_port} opened.")
+            except Exception as e:
+                self.ser = None
+                print(f"Warning: Could not open serial port {self.arduino_port}. Serial features disabled. ({e})")
+        
+            cv2.namedWindow('Traffic Monitoring', cv2.WINDOW_NORMAL)
+            
+        except Exception as e:
+            print(f"Initialization error: {str(e)}")
+            self.cleanup()
+            sys.exit(1)
+
+    def process_frame(self, frame: np.ndarray, sub_index: int) -> Tuple[np.ndarray, int]:
+        """Process individual frame and return annotated frame with vehicle count"""
+        try:
+            # Background subtraction
+            fg_mask = self.back_subs[sub_index].apply(frame)
+            
+            # Noise reduction
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Contour detection
+            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Vehicle counting
+            vehicle_count = 0
+            for cnt in contours:
+                if cv2.contourArea(cnt) > self.min_contour_area:
+                    vehicle_count += 1
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Adding informational overlay
+            cv2.putText(frame, f"Lane {sub_index+1}: {vehicle_count} vehicles", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            return frame, vehicle_count
+        
+        except Exception as e:
+            print(f"Frame processing error: {str(e)}")
+            return frame, 0  # Return the original frame and a count of 0 in case of error
+
+    def send_to_arduino(self, vehicle_counts: List[int]):
+        """Cyclically assign green time based on busyness, with proper transitions and timing, avoiding oscillation."""
+        try:
+            current_time = time.time()
+            if not hasattr(self, 'last_send'):
+                self.last_send = 0
+            if not hasattr(self, 'cycle_order'):
+                self.cycle_order = []
+            if not hasattr(self, 'cycle_index'):
+                self.cycle_index = 0
+
+            # Only consider lanes with at least 1 car
+            lanes_with_cars = [(i, c) for i, c in enumerate(vehicle_counts) if c > 0]
+            if not lanes_with_cars:
+                print("No cars detected, skipping cycle.")
+                return
+
+            # Sort lanes by vehicle count (descending)
+            sorted_lanes = sorted(lanes_with_cars, key=lambda x: (-x[1], x[0]))
+            self.cycle_order = [i for i, _ in sorted_lanes]
+            n = len(self.cycle_order)
+
+            # Assign durations
+            durations = {}
+            if n == 1:
+                durations[self.cycle_order[0]] = 8
+            elif n == 2:
+                durations[self.cycle_order[0]] = 8
+                durations[self.cycle_order[1]] = 4
+            else:
+                durations[self.cycle_order[0]] = 8
+                durations[self.cycle_order[-1]] = 4
+                for i in range(1, n-1):
+                    durations[self.cycle_order[i]] = 6
+
+            # Find the next lane in the cycle (not the same as last)
+            if not hasattr(self, 'last_green_lane') or self.last_green_lane not in self.cycle_order:
+                next_idx = 0
+            else:
+                last_idx = self.cycle_order.index(self.last_green_lane)
+                next_idx = (last_idx + 1) % n
+            priority_lane = self.cycle_order[next_idx]
+            duration = max(durations[priority_lane], 4)
+
+            # --- Transition: Green → Yellow (2s) → Red, then next lane green immediately ---
+            if hasattr(self, 'last_green_lane') and self.last_green_lane is not None:
+                yellow_cmd = f"YELLOW{self.last_green_lane+1}\n"
+                if self.ser and self.ser.is_open:
+                    self.ser.write(yellow_cmd.encode())
+                else:
+                    print("Serial not connected, would send:", yellow_cmd.strip())
+                print(f"Sent: {yellow_cmd.strip()}")
+                time.sleep(2)
+
+                red_cmd = f"RED{self.last_green_lane+1}\n"
+                if self.ser and self.ser.is_open:
+                    self.ser.write(red_cmd.encode())
+                else:
+                    print("Serial not connected, would send:", red_cmd.strip())
+                print(f"Sent: {red_cmd.strip()}")
+
+            green_cmd = f"P{priority_lane+1}T{duration}\n"
+            if self.ser and self.ser.is_open:
+                self.ser.write(green_cmd.encode())
+            else:
+                print("Serial not connected, would send:", green_cmd.strip())
+            print(f"Sent: {green_cmd.strip()}")
+
+            self.last_send = current_time
+            self.last_green_lane = priority_lane
+
+        except Exception as e:
+            print(f"Comms error: {str(e)}")
+
+    def try_reconnect_serial(self):
+        """Attempt to reconnect to the serial port if not connected."""
+        if self.ser is None or not self.ser.is_open:
+            try:
+                self.ser = serial.Serial(self.arduino_port, self.baud_rate, timeout=1)
+                time.sleep(2)
+                print(f"Serial port {self.arduino_port} reconnected.")
+            except Exception as e:
+                self.ser = None
+                # Only print occasionally to avoid spamming the console
+                if not hasattr(self, '_last_reconnect_warn') or time.time() - self._last_reconnect_warn > 5:
+                    print(f"Warning: Could not reconnect serial port {self.arduino_port}. ({e})")
+                    self._last_reconnect_warn = time.time()
+
+    def run_analysis(self):
+        """Main processing loop with Arduino integration"""
+        try:
+            while True:
+                frames = []
+                vehicle_counts = []
+                
+                # Process video streams
+                for i, cap in enumerate(self.caps):
+                    ret, frame = cap.read()
+                    if not ret:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                    
+                    processed_frame, count = self.process_frame(frame, i)
+                    frames.append(processed_frame)
+                    vehicle_counts.append(count)
+                
+                # Display and communication
+                combined_frame = np.vstack((
+                    np.hstack((frames[0], frames[1])),
+                    np.hstack((frames[2], frames[3]))
+                ))
+                cv2.imshow('Traffic Monitoring', combined_frame)
+                
+                # Send data to Arduino
+                self.send_to_arduino(vehicle_counts)
+                self.try_reconnect_serial()  # Check serial connection
+                
+                if cv2.waitKey(30) & 0xFF == 27:
+                    break
+                    
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Release all resources"""
+        for cap in self.caps:
+            cap.release()
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        cv2.destroyAllWindows()
+        print("Resources released")
+
+if __name__ == "__main__":
+    VIDEO_PATHS = [
+        r"C:\Users\user\Desktop\5th\lane1.mp4",
+        r"C:\Users\user\Desktop\5th\lane2.mp4",
+        r"C:\Users\user\Desktop\5th\lane3.mp4",
+        r"C:\Users\user\Desktop\5th\lane4.mp4",
+    ]
+    
+    # Update COM port according to your system (Bluetooth COM4 as example)
+    analyzer = TrafficAnalyzer(VIDEO_PATHS, arduino_port='COM4')
+    analyzer.run_analysis()
